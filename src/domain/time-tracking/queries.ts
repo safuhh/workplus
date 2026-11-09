@@ -245,3 +245,17 @@ export async function rpcResetTodayTimer(
   }
   return data as { success: boolean; deleted: boolean; work_date: string }
 }
+
+/**
+ * Fetch the authoritative current timestamp from Supabase PostgreSQL.
+ * Used to calculate and adjust for any client device clock skew.
+ */
+export async function fetchServerTime(): Promise<Date | null> {
+  try {
+    const { data, error } = await supabase.rpc('get_server_time')
+    if (error || !data) return null
+    return new Date(data as string)
+  } catch {
+    return null
+  }
+}

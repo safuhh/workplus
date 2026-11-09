@@ -1,11 +1,13 @@
 /**
  * AuthPage — sign-in and sign-up forms using Supabase email/password auth
- * with full Dark/Light theme support.
+ * with full Dark/Light theme support, browser password-manager integration,
+ * autofill compatibility, and Remember Me session persistence.
  */
 
 import { useState, type FormEvent } from 'react'
 import { Navigate } from 'react-router-dom'
 import { supabase } from '../../lib/supabase/client'
+import { getRememberMePreference, setRememberMePreference } from '../../lib/supabase/authStorage'
 import { useAuth } from './context'
 import { ThemeToggle } from '../theme/ThemeToggle'
 import { Clock } from 'lucide-react'
@@ -15,8 +17,18 @@ type Mode = 'signin' | 'signup'
 export function AuthPage() {
   const { user, loading } = useAuth()
   const [mode, setMode] = useState<Mode>('signin')
-  const [email, setEmail] = useState('')
+  const [email, setEmail] = useState(() => {
+    if (typeof window !== 'undefined') {
+      try {
+        return localStorage.getItem('workpulse_saved_email') || ''
+      } catch {
+        return ''
+      }
+    }
+    return ''
+  })
   const [password, setPassword] = useState('')
+  const [rememberMe, setRememberMe] = useState(() => getRememberMePreference())
   const [submitting, setSubmitting] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [successMsg, setSuccessMsg] = useState<string | null>(null)
@@ -24,29 +36,77 @@ export function AuthPage() {
   if (loading) return null
   if (user) return <Navigate to="/" replace />
 
-  async function handleSubmit(e: FormEvent) {
+  async function handleSubmit(e: FormEvent<HTMLFormElement>) {
     e.preventDefault()
     setError(null)
     setSuccessMsg(null)
     setSubmitting(true)
+
+    // Read values from form DOM to support password managers that autofill DOM elements directly
+    const form = e.currentTarget
+    const formData = new FormData(form)
+    const submittedEmail = (
+      (formData.get('username') as string) ||
+      (formData.get('email') as string) ||
+      email
+    ).trim()
+    const submittedPassword = (formData.get('password') as string) || password
+
     try {
+      // Set the session persistence preference before authentication
+      setRememberMePreference(rememberMe)
+
+      if (rememberMe) {
+        try {
+          localStorage.setItem('workpulse_saved_email', submittedEmail)
+        } catch {
+          // Ignore storage quota errors
+        }
+      } else {
+        try {
+          localStorage.removeItem('workpulse_saved_email')
+        } catch {
+          // Ignore
+        }
+      }
+
       if (mode === 'signup') {
         const { error } = await supabase.auth.signUp({
-          email: email.trim(),
-          password,
+          email: submittedEmail,
+          password: submittedPassword,
         })
         if (error) throw error
         setSuccessMsg('Account created successfully. You can now sign in.')
       } else {
         const { error } = await supabase.auth.signInWithPassword({
-          email: email.trim(),
-          password,
+          email: submittedEmail,
+          password: submittedPassword,
         })
         if (error) {
           if (error.message.toLowerCase().includes('invalid login credentials')) {
             throw new Error('Invalid email or password. Please verify your credentials and try again.')
           }
           throw error
+        }
+
+        // Signal to the browser password manager (Chrome, Edge, Safari) that login succeeded
+        if (
+          typeof window !== 'undefined' &&
+          'PasswordCredential' in window &&
+          navigator.credentials &&
+          typeof navigator.credentials.store === 'function'
+        ) {
+          try {
+            // @ts-expect-error - PasswordCredential is standard in modern browsers
+            const cred = new window.PasswordCredential({
+              id: submittedEmail,
+              password: submittedPassword,
+              name: submittedEmail,
+            })
+            void navigator.credentials.store(cred)
+          } catch {
+            // Non-blocking fallback
+          }
         }
         // AuthContext will update session automatically via onAuthStateChange
       }
@@ -97,16 +157,24 @@ export function AuthPage() {
             </div>
           )}
 
-          <form onSubmit={handleSubmit} className="space-y-4">
+          {/* Standard HTML login form for browser password-manager & autofill support */}
+          <form
+            id="login-form"
+            name="login"
+            method="post"
+            action="#"
+            onSubmit={handleSubmit}
+            className="space-y-4"
+          >
             <div>
               <label htmlFor="email" className="block text-sm font-medium text-slate-700 dark:text-slate-300 mb-1">
                 Email
               </label>
               <input
                 id="email"
-                name="email"
+                name="username"
                 type="email"
-                autoComplete="email"
+                autoComplete="username"
                 required
                 value={email}
                 onChange={(e) => setEmail(e.target.value)}
@@ -131,6 +199,27 @@ export function AuthPage() {
                 placeholder="••••••••"
               />
             </div>
+
+            {/* Remember Me Checkbox */}
+            {mode === 'signin' && (
+              <div className="flex items-center justify-between pt-0.5">
+                <label
+                  htmlFor="remember-me"
+                  className="flex items-center gap-2 cursor-pointer select-none text-sm text-slate-600 dark:text-slate-300 hover:text-slate-900 dark:hover:text-white transition-colors"
+                >
+                  <input
+                    id="remember-me"
+                    name="remember-me"
+                    type="checkbox"
+                    checked={rememberMe}
+                    onChange={(e) => setRememberMe(e.target.checked)}
+                    className="h-4 w-4 rounded border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-brand-600 focus:ring-brand-500 dark:focus:ring-offset-slate-900 cursor-pointer accent-brand-600 transition"
+                  />
+                  <span>Remember me</span>
+                </label>
+              </div>
+            )}
+
             <button
               type="submit"
               disabled={submitting}

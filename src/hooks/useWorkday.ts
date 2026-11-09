@@ -1,18 +1,21 @@
 /**
- * useWorkday hook — the core timer state manager.
+ * useWorkday hook — the core persistent background time-tracking engine.
  *
- * - Loads the active session and entries from Supabase on mount.
- * - Recovers correctly after refresh, tab close, or OS sleep.
- * - Drives a 1-second display tick (never writes to DB every second).
- * - Resyncs from Supabase on page visibility restore (after sleep/suspend).
- * - Provides full Start, Pause, Resume, Stop controls for Work and Break timers.
+ * Implements a pure timestamp-based architecture using Supabase PostgreSQL as the single source of truth:
+ * - Persists UTC start timestamps (`started_at`) and interval boundaries (`ended_at`) in PostgreSQL.
+ * - Closing browser tab, closing browser, or device sleep NEVER stops active timers.
+ * - Restores active sessions and computes elapsed duration instantly from persisted timestamps on reopen.
+ * - Synchronizes with Supabase PostgreSQL server time to eliminate local device clock drift.
+ * - Handles all browser lifecycle events: tab closure, refresh, reopen, minimize, OS sleep/wake, and network online/offline.
+ * - Accurately computes running vs paused durations: paused intervals are strictly excluded.
  */
 
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useState, useRef } from 'react'
 import { useAuth } from '../features/auth/context'
 import {
   fetchActiveSession,
   fetchEntriesForSession,
+  fetchServerTime,
   rpcStartWork,
   rpcPauseWork,
   rpcResumeWork,
@@ -37,6 +40,8 @@ export interface UseWorkdayReturn {
   error: string | null
   transitioning: boolean
   nowMs: number
+  isOnline: boolean
+  lastSyncedAt: Date | null
   startWork: () => Promise<void>
   pauseWork: () => Promise<void>
   resumeWork: () => Promise<void>
@@ -58,7 +63,33 @@ export function useWorkday(settings: UserSettings): UseWorkdayReturn {
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [transitioning, setTransitioning] = useState(false)
-  const [nowMs, setNowMs] = useState(() => Date.now())
+  const [isOnline, setIsOnline] = useState<boolean>(() =>
+    typeof navigator !== 'undefined' ? navigator.onLine : true,
+  )
+  const [lastSyncedAt, setLastSyncedAt] = useState<Date | null>(null)
+
+  // Server clock offset in milliseconds (serverTime - clientTime) to avoid local device clock drift
+  const serverOffsetRef = useRef<number>(0)
+  const lastTickRef = useRef<number>(Date.now())
+
+  const getEffectiveNowMs = useCallback(() => {
+    return Date.now() + serverOffsetRef.current
+  }, [])
+
+  const [nowMs, setNowMs] = useState<number>(() => Date.now())
+
+  // ── Synchronize Authoritative Server Time ──────────────────────────────────
+  const syncServerTime = useCallback(async () => {
+    try {
+      const serverTime = await fetchServerTime()
+      if (serverTime) {
+        serverOffsetRef.current = serverTime.getTime() - Date.now()
+        setNowMs(Date.now() + serverOffsetRef.current)
+      }
+    } catch {
+      // Fallback gracefully to device clock if server time check fails
+    }
+  }, [])
 
   // ── Load active session from Supabase ──────────────────────────────────────
   const loadActiveSession = useCallback(async () => {
@@ -69,6 +100,9 @@ export function useWorkday(settings: UserSettings): UseWorkdayReturn {
       return
     }
     try {
+      // Synchronize clock offset alongside session fetch
+      void syncServerTime()
+
       const s = await fetchActiveSession(settings.timezone)
       setSession(s)
       if (s) {
@@ -77,13 +111,14 @@ export function useWorkday(settings: UserSettings): UseWorkdayReturn {
       } else {
         setEntries([])
       }
+      setLastSyncedAt(new Date())
       setError(null)
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : 'Failed to load session.')
     } finally {
       setLoading(false)
     }
-  }, [user, settings.timezone])
+  }, [user, settings.timezone, syncServerTime])
 
   // ── Initial load ───────────────────────────────────────────────────────────
   useEffect(() => {
@@ -91,26 +126,77 @@ export function useWorkday(settings: UserSettings): UseWorkdayReturn {
     void loadActiveSession()
   }, [loadActiveSession])
 
-  // ── 1-second display tick (no DB writes) ──────────────────────────────────
-  // Only tick when a timer is actively running (working or on_break)
+  // ── 1-second display tick (no DB writes) with OS Sleep/Wake detection ──────
+  // Only ticks when a timer is actively running (working or on_break)
   const isTimerRunning = session?.status === 'working' || session?.status === 'on_break'
   useEffect(() => {
     if (!isTimerRunning) return
-    const interval = setInterval(() => {
-      setNowMs(Date.now())
-    }, 1000)
-    return () => clearInterval(interval)
-  }, [isTimerRunning])
+    lastTickRef.current = Date.now()
 
-  // ── Page Visibility: resync after tab becomes active (sleep recovery) ─────
+    const interval = setInterval(() => {
+      const now = Date.now()
+      const delta = now - lastTickRef.current
+      lastTickRef.current = now
+
+      // OS Sleep / background suspension detection:
+      // If delta > 2500ms, the OS suspended JS execution (laptop closed/sleep).
+      // Immediately calculate true elapsed time and resync with Supabase.
+      if (delta > 2500) {
+        setNowMs(now + serverOffsetRef.current)
+        void loadActiveSession()
+      } else {
+        setNowMs(now + serverOffsetRef.current)
+      }
+    }, 1000)
+
+    return () => clearInterval(interval)
+  }, [isTimerRunning, loadActiveSession])
+
+  // ── Browser Lifecycle & Network Event Listeners ───────────────────────────
   useEffect(() => {
-    function onVisibilityChange() {
-      if (document.visibilityState === 'visible' && session) {
+    function handleResync() {
+      setNowMs(Date.now() + serverOffsetRef.current)
+      if (session) {
         void loadActiveSession()
       }
     }
+
+    function onVisibilityChange() {
+      if (document.visibilityState === 'visible') {
+        handleResync()
+      }
+    }
+
+    function onFocus() {
+      handleResync()
+    }
+
+    function onPageShow() {
+      handleResync()
+    }
+
+    function onOnline() {
+      setIsOnline(true)
+      handleResync()
+    }
+
+    function onOffline() {
+      setIsOnline(false)
+    }
+
     document.addEventListener('visibilitychange', onVisibilityChange)
-    return () => document.removeEventListener('visibilitychange', onVisibilityChange)
+    window.addEventListener('focus', onFocus)
+    window.addEventListener('pageshow', onPageShow)
+    window.addEventListener('online', onOnline)
+    window.addEventListener('offline', onOffline)
+
+    return () => {
+      document.removeEventListener('visibilitychange', onVisibilityChange)
+      window.removeEventListener('focus', onFocus)
+      window.removeEventListener('pageshow', onPageShow)
+      window.removeEventListener('online', onOnline)
+      window.removeEventListener('offline', onOffline)
+    }
   }, [loadActiveSession, session])
 
   // ── Computed display values ───────────────────────────────────────────────
@@ -126,6 +212,7 @@ export function useWorkday(settings: UserSettings): UseWorkdayReturn {
     try {
       const result = await fn()
       onSuccess(result)
+      setLastSyncedAt(new Date())
       // Refresh entries and session to guarantee consistency with DB timestamps
       void loadActiveSession()
     } catch (err: unknown) {
@@ -251,7 +338,8 @@ export function useWorkday(settings: UserSettings): UseWorkdayReturn {
       // Immediately reset local state to empty
       setSession(null)
       setEntries([])
-      setNowMs(Date.now())
+      setNowMs(getEffectiveNowMs())
+      setLastSyncedAt(new Date())
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : 'Failed to reset timer.'
       setError(msg)
@@ -259,7 +347,7 @@ export function useWorkday(settings: UserSettings): UseWorkdayReturn {
     } finally {
       setTransitioning(false)
     }
-  }, [settings.timezone])
+  }, [settings.timezone, getEffectiveNowMs])
 
   return {
     session,
@@ -269,6 +357,8 @@ export function useWorkday(settings: UserSettings): UseWorkdayReturn {
     error,
     transitioning,
     nowMs,
+    isOnline,
+    lastSyncedAt,
     startWork,
     pauseWork,
     resumeWork,

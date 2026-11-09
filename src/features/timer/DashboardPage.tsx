@@ -48,6 +48,8 @@ export function DashboardPage({ settings }: DashboardPageProps) {
     error,
     transitioning,
     nowMs,
+    isOnline,
+    lastSyncedAt,
     startWork,
     pauseWork,
     resumeWork,
@@ -161,6 +163,17 @@ export function DashboardPage({ settings }: DashboardPageProps) {
 
   return (
     <div className="space-y-6">
+      {/* Offline Alert */}
+      {!isOnline && (
+        <div
+          className="rounded-xl bg-amber-50 dark:bg-amber-950/40 border border-amber-200 dark:border-amber-900/60 px-4 py-3 text-xs text-amber-800 dark:text-amber-300 flex items-center gap-2.5"
+          role="status"
+        >
+          <AlertTriangle className="h-4 w-4 text-amber-500 flex-shrink-0" />
+          <span>You are currently offline. Timers continue tracking elapsed time in the background and will sync when reconnected.</span>
+        </div>
+      )}
+
       {/* Success alert */}
       {successMessage && (
         <SuccessAlert message={successMessage} onDismiss={() => setSuccessMessage(null)} />
@@ -358,7 +371,7 @@ export function DashboardPage({ settings }: DashboardPageProps) {
             onClick={() => void refresh()}
             disabled={transitioning || resetting}
             className="text-xs text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-200 flex items-center gap-1.5 transition-colors cursor-pointer px-2.5 py-1 rounded-lg hover:bg-slate-100 dark:hover:bg-slate-800"
-            title="Resync with database"
+            title={lastSyncedAt ? `Last synced at ${lastSyncedAt.toLocaleTimeString()}` : 'Resync with database'}
             aria-label="Resync with database"
           >
             <RefreshCw className={`h-3.5 w-3.5 ${transitioning ? 'animate-spin' : ''}`} />
